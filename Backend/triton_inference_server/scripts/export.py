@@ -5,6 +5,16 @@ import subprocess
 import time
 import shutil
 
+try:
+    import ultralytics
+    import tritonclient
+except ImportError:
+    print("Installing required packages...")
+    subprocess.check_call(["pip", "install", "ultralytics==1.98", "tritonclient[all]==2.51.0"])
+    # Re-import after installation
+    import ultralytics
+    import tritonclient
+
 from tritonclient.http import InferenceServerClient
 
 def export_model(model_path, model_name, triton_model_path):
