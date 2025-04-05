@@ -52,6 +52,12 @@ def parse_args():
     # Required/key options
     parser.add_argument("--frame", type=int, default=160,
                         help="Frame number to process (default: 160)")
+    parser.add_argument("--start-frame", type=int,
+                        help="Starting frame number for processing multiple frames")
+    parser.add_argument("--end-frame", type=int,
+                        help="Ending frame number for processing multiple frames")
+    parser.add_argument("--loop", action="store_true",
+                        help="Process frames in a continuous loop from start to end")
     
     # Configuration options
     parser.add_argument("--config", type=str, 
@@ -70,6 +76,18 @@ def parse_args():
                         help="Directory to save output (default: output)")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug mode with additional outputs")
+    parser.add_argument("--skip-saving", action="store_true",
+                        help="Skip saving JSON files to disk (only publish to MQTT if enabled)")
+    
+    # MQTT options
+    parser.add_argument("--mqtt-broker", type=str, default="localhost",
+                        help="MQTT broker address (default: localhost)")
+    parser.add_argument("--mqtt-port", type=int, default=1883,
+                        help="MQTT broker port (default: 1883)")
+    parser.add_argument("--mqtt-topic", type=str, default="soccer3d/data",
+                        help="MQTT topic for publishing data (default: soccer3d/data)")
+    parser.add_argument("--mqtt-disable", action="store_true",
+                        help="Disable MQTT publishing")
     
     return parser.parse_args()
 
@@ -639,31 +657,73 @@ def create_output(
     return output
 
 
-def save_output(output_data: Dict[str, Any], output_dir: str, frame_number: int) -> str:
+def save_output(output_data: Dict[str, Any], output_dir: str, frame_number: int, skip_saving: bool = False) -> str:
     """
-    Save output data to a JSON file.
+    Save output data to a JSON file and publish to MQTT broker.
     
     Args:
         output_data: Output data dictionary
         output_dir: Directory to save output
         frame_number: Frame number for filename
+        skip_saving: Whether to skip saving the JSON file to disk
         
     Returns:
-        Path to saved file
+        Path to saved file or empty string if skipped
     """
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
+    # Convert output data to JSON string
+    json_str = json.dumps(output_data, indent=2)
     
-    # Generate filename
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"soccer3d_frame_{frame_number}_{timestamp}.json"
-    filepath = os.path.join(output_dir, filename)
+    filepath = ""
+    if not skip_saving:
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Generate filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"soccer3d_frame_{frame_number}_{timestamp}.json"
+        filepath = os.path.join(output_dir, filename)
+        
+        # Write to file
+        with open(filepath, 'w') as f:
+            f.write(json_str)
+        
+        logger.info(f"Output saved to {filepath}")
     
-    # Write to file
-    with open(filepath, 'w') as f:
-        json.dump(output_data, f, indent=2)
+    # Check if MQTT is available
+    try:
+        import paho.mqtt.client as mqtt
+        
+        # Publish to MQTT broker if mqtt configuration exists
+        if config.get('mqtt_broker'):
+            try:
+                broker = config.get('mqtt_broker', 'localhost')
+                port = config.get('mqtt_port', 1883)
+                topic = config.get('mqtt_topic', 'soccer3d/data')
+                
+                # Create MQTT client
+                client = mqtt.Client()
+                
+                # Connect to broker
+                logger.info(f"Connecting to MQTT broker at {broker}:{port}")
+                client.connect(broker, port, 60)
+                
+                # Publish data
+                logger.info(f"Publishing data to topic: {topic}")
+                result = client.publish(topic, json_str)
+                
+                # Check if publish was successful
+                if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                    logger.info("Data successfully published to MQTT broker")
+                else:
+                    logger.warning(f"Failed to publish data to MQTT broker: {result.rc}")
+                
+                # Disconnect
+                client.disconnect()
+            except Exception as e:
+                logger.error(f"Error publishing to MQTT broker: {e}")
+    except ImportError:
+        logger.warning("paho-mqtt not installed. MQTT publishing disabled.")
     
-    logger.info(f"Output saved to {filepath}")
     return filepath
 
 
@@ -685,6 +745,16 @@ def main():
     if args.log_level:
         config['log_level'] = args.log_level
     
+    # Add MQTT parameters to config if present in args
+    if hasattr(args, 'mqtt_broker') and args.mqtt_broker:
+        config['mqtt_broker'] = args.mqtt_broker
+    if hasattr(args, 'mqtt_port') and args.mqtt_port:
+        config['mqtt_port'] = args.mqtt_port
+    if hasattr(args, 'mqtt_topic') and args.mqtt_topic:
+        config['mqtt_topic'] = args.mqtt_topic
+    if hasattr(args, 'mqtt_disable') and args.mqtt_disable:
+        config['mqtt_disable'] = args.mqtt_disable
+    
     # Show current configuration
     logger.info(f"Using configuration: {config}")
     
@@ -704,22 +774,61 @@ def main():
         warmup_pytorch_cuda()
         warmup_triton_inference(config)
     
-    # Process the requested frame
-    frame_number = args.frame
-    logger.info(f"Processing frame {frame_number}")
+    # Determine frame range to process
+    start_frame = args.start_frame if args.start_frame is not None else args.frame
+    end_frame = args.end_frame if args.end_frame is not None else start_frame
+    
+    # Make sure start_frame <= end_frame
+    if start_frame > end_frame:
+        logger.warning(f"Start frame ({start_frame}) is greater than end frame ({end_frame}). Swapping values.")
+        start_frame, end_frame = end_frame, start_frame
+    
+    logger.info(f"Frame processing range: {start_frame} to {end_frame}")
+    if args.loop:
+        logger.info("Loop mode enabled: Will process frames continuously until interrupted")
+        if not args.skip_saving:
+            logger.warning("Loop mode is enabled but --skip-saving is not. This may generate a lot of files.")
     
     try:
-        # Process the frame
-        results = process_frame(frame_number, config)
+        # Process frames
+        current_frame = start_frame
         
-        # Save the results
-        if results:
-            save_output(results, args.output_dir, frame_number)
-        else:
-            logger.error(f"No results generated for frame {frame_number}")
+        while True:
+            logger.info(f"Processing frame {current_frame}")
+            
+            try:
+                # Process the frame
+                results = process_frame(current_frame, config)
+                
+                # Save the results
+                if results:
+                    save_output(results, args.output_dir, current_frame, args.skip_saving)
+                else:
+                    logger.error(f"No results generated for frame {current_frame}")
+            except Exception as e:
+                logger.error(f"Error processing frame {current_frame}: {e}")
+            
+            # Move to next frame
+            current_frame += 1
+            
+            # Check if we've reached the end of the range
+            if current_frame > end_frame:
+                if args.loop:
+                    logger.info(f"Reached end frame {end_frame}, looping back to start frame {start_frame}")
+                    current_frame = start_frame
+                    # Add a small delay to avoid overwhelming the system
+                    time.sleep(0.1)
+                else:
+                    logger.info(f"Reached end frame {end_frame}, processing complete")
+                    break
+                    
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt detected. Exiting gracefully...")
     except Exception as e:
-        logger.error(f"Error processing frame {frame_number}: {e}", exc_info=True)
+        logger.error(f"Unexpected error: {e}", exc_info=True)
         sys.exit(1)
+    
+    logger.info("Soccer3D processing complete")
 
 
 if __name__ == "__main__":
