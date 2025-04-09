@@ -9,13 +9,14 @@ import time
 import math
 import logging
 from typing import Dict, List, Tuple, Optional, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 
 # Third-party imports
 import numpy as np
 
 # Local imports
 from soccer3d.models.pose import POSE_KEYPOINT_NAMES
+from soccer3d.utils.threading import get_thread_pool
 
 logger = logging.getLogger("Soccer3D")
 
@@ -85,21 +86,24 @@ def find_ray_intersection(rays: List[Tuple[np.ndarray, np.ndarray]], entity_name
             # Prepare data for parallel processing
             ray_items = [(i, ray) for i, ray in enumerate(rays)]
             
-            # Process rays in parallel
+            # Process rays in parallel using our reusable thread pool
             parallel_start_time = time.time()
-            with ThreadPoolExecutor(max_workers=min(max_workers, len(rays))) as executor:
-                # Submit all ray processing tasks and collect futures
-                futures = [executor.submit(process_ray, item) for item in ray_items]
-                
-                # Process results as they complete
-                for future in as_completed(futures):
-                    try:
-                        i, skew, b_vector = future.result()
-                        # Add to system matrix and right-hand side
-                        A[i*3:(i+1)*3] = skew
-                        b[i*3:(i+1)*3] = b_vector
-                    except Exception as e:
-                        logger.error(f"Error in parallel ray processing: {e}")
+            
+            # Get thread pool for ray processing
+            executor = get_thread_pool('ray_processing', max_workers=min(max_workers, len(rays)))
+            
+            # Submit all ray processing tasks and collect futures
+            futures = [executor.submit(process_ray, item) for item in ray_items]
+            
+            # Process results as they complete
+            for future in as_completed(futures):
+                try:
+                    i, skew, b_vector = future.result()
+                    # Add to system matrix and right-hand side
+                    A[i*3:(i+1)*3] = skew
+                    b[i*3:(i+1)*3] = b_vector
+                except Exception as e:
+                    logger.error(f"Error in parallel ray processing: {e}")
             
             parallel_time = time.time() - parallel_start_time
             if 'parallel_ray_processing' in TIMING:
@@ -168,32 +172,35 @@ def triangulate_pose(pose_rays: Dict[int, List[Tuple[np.ndarray, np.ndarray]]], 
         if kp in pose_rays:
             logger.debug(f"Keypoint {POSE_KEYPOINT_NAMES.get(kp, kp)} has {len(pose_rays[kp])} rays")
     
-    triangulation_start_time = time.time()  # Track triangulation time
+    triangulation_start_time = time.time()
     
     try:
         # Process each keypoint in parallel but with limited concurrency
         max_workers = config.get('max_workers', 8) if config else 8
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_keypoint = {
-                executor.submit(
-                    find_ray_intersection, 
-                    rays, 
-                    f"keypoint_{POSE_KEYPOINT_NAMES.get(keypoint_idx, keypoint_idx)}",
-                    config
-                ): keypoint_idx
-                for keypoint_idx, rays in pose_rays.items()
-                if len(rays) >= 2  # Need at least 2 rays
-            }
-            
-            for future in as_completed(future_to_keypoint):
-                keypoint_idx = future_to_keypoint[future]
-                try:
-                    intersection_point = future.result()
-                    
-                    if intersection_point is not None:
-                        pose_3d[keypoint_idx] = intersection_point
-                except Exception as e:
-                    logger.error(f"Error triangulating keypoint {keypoint_idx}: {e}")
+        
+        # Use our reusable thread pool instead of creating a new one
+        executor = get_thread_pool('keypoint_triangulation', max_workers=max_workers)
+        
+        future_to_keypoint = {
+            executor.submit(
+                find_ray_intersection, 
+                rays, 
+                f"keypoint_{POSE_KEYPOINT_NAMES.get(keypoint_idx, keypoint_idx)}",
+                config
+            ): keypoint_idx
+            for keypoint_idx, rays in pose_rays.items()
+            if len(rays) >= 2  # Need at least 2 rays
+        }
+        
+        for future in as_completed(future_to_keypoint):
+            keypoint_idx = future_to_keypoint[future]
+            try:
+                intersection_point = future.result()
+                
+                if intersection_point is not None:
+                    pose_3d[keypoint_idx] = intersection_point
+            except Exception as e:
+                logger.error(f"Error triangulating keypoint {keypoint_idx}: {e}")
         
         # Capture the full triangulation time
         triangulation_time = time.time() - triangulation_start_time

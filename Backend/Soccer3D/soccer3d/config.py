@@ -3,7 +3,11 @@ Configuration module for Soccer3D.
 """
 import os
 import yaml
+import multiprocessing
 from typing import Dict, Any, Optional
+
+# Detect CPU core count for optimal performance
+CPU_COUNT = multiprocessing.cpu_count()
 
 # Default configuration parameters
 DEFAULT_CONFIG = {
@@ -11,9 +15,9 @@ DEFAULT_CONFIG = {
     'ball_conf_threshold': 0.1,
     'pose_visibility_threshold': 0.5,
     'pose_from_detection_padding': 20,
-    'max_workers': 20,  # Updated to use 20 workers for a 24-core system
-    'player_model_url': "http://localhost:8001/v2/models/player_detector",
-    'ball_model_url': "http://localhost:8000/v2/models/ball_detector",
+    'max_workers': max(16, CPU_COUNT - 2),  # Use most cores but leave some for system
+    'player_model_path': "soccer3d/models/player_model/model.engine", # Path to player detection model
+    'ball_model_path': "soccer3d/models/ball_model/model.engine",     # Path to ball detection model
     'player_model_size': (640, 640),
     'ball_model_size': (640, 640),
     'silence_model_output': True,
@@ -23,7 +27,7 @@ DEFAULT_CONFIG = {
         'up_axis': 'z'
     },
     'max_ray_cache_size': 10000,
-    'mp_pose_pool_size': 20,
+    'mp_pose_pool_size': max(8, min(CPU_COUNT // 2, 20)),  # Half of cores, max 20
     'mp_pose_complexity': 0,
     'log_level': 'INFO',
 }

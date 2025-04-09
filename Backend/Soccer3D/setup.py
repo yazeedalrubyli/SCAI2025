@@ -8,11 +8,11 @@ setup(
     install_requires=[
         "numpy",
         "opencv-python",
-        "tritonclient[all]",
         "supervision",
         "mediapipe",
         "torch",
         "torchvision",
+        "ultralytics",  # For YOLO models
     ],
     entry_points={
         "console_scripts": [

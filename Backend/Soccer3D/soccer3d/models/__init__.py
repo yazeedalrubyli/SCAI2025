@@ -3,24 +3,24 @@ Models package for Soccer3D - handles detection and pose estimation.
 """
 
 from soccer3d.models.detection import (
-    initialize_triton_clients,
-    check_models_ready,
     perform_yolo_inference_batched,
-    warmup_triton_inference,
+    warmup_pytorch_cuda,
+    get_yolo_model,
+    load_yolo_model,
+    warmup_yolo_models,
 )
 
 from soccer3d.models.pose import (
     initialize_mp_pose_pool,
     process_pose_from_detection,
-    warmup_pytorch_cuda,
 )
 
 __all__ = [
-    'initialize_triton_clients',
-    'check_models_ready',
     'perform_yolo_inference_batched',
-    'warmup_triton_inference',
+    'warmup_pytorch_cuda',
+    'get_yolo_model',
+    'load_yolo_model',
+    'warmup_yolo_models',
     'initialize_mp_pose_pool',
     'process_pose_from_detection',
-    'warmup_pytorch_cuda',
 ]

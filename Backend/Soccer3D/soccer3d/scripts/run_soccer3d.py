@@ -11,21 +11,23 @@ import json
 import time
 import argparse
 from datetime import datetime
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import multiprocessing
 
 # Third-party imports
 import numpy as np
+import cv2
+from ultralytics import YOLO  # Import Ultralytics YOLO
 
 # Local imports
 from soccer3d import initialize
 from soccer3d.models import (
-    initialize_triton_clients,
-    perform_yolo_inference_batched,
-    warmup_triton_inference,
     initialize_mp_pose_pool,
     process_pose_from_detection,
     warmup_pytorch_cuda,
+    warmup_yolo_models,
 )
 from soccer3d.utils import (
     extract_camera_position,
@@ -38,12 +40,167 @@ from soccer3d.utils import (
     get_cardinal_direction,
     get_field_direction,
 )
-from soccer3d.utils.camera import preload_camera_frames
+from soccer3d.utils.camera import preload_camera_frames, load_camera_transforms_cached, preload_all_frames
+from soccer3d.utils.threading import get_thread_pool, shutdown_thread_pools
 from soccer3d.logger import SuppressOutput
 
 # Global variables
 logger = None
 config = None
+# YOLO model caches - to avoid reloading models
+player_model = None
+ball_model = None
+
+# Global result cache for batching writes
+_OUTPUT_CACHE = []
+_OUTPUT_CACHE_LOCK = threading.RLock()
+_LAST_WRITE_TIME = 0
+_WRITE_INTERVAL = 5.0  # Seconds between batch writes
+
+# Global preloaded frames cache
+_ALL_PRELOADED_FRAMES = {}
+
+# Add Ultralytics YOLO functions
+def load_yolo_model(model_path: str) -> YOLO:
+    """
+    Load a YOLO model using Ultralytics.
+    
+    Args:
+        model_path: Path to the YOLO model file
+        
+    Returns:
+        YOLO model
+    """
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"YOLO model not found at {model_path}")
+    
+    try:
+        # Ultralytics handles device selection automatically
+        model = YOLO(model_path)
+        logger.info(f"Loaded YOLO model from {model_path} using device: {model.device}")
+        return model
+    except Exception as e:
+        logger.error(f"Error loading YOLO model: {e}")
+        raise
+
+def perform_yolo_inference_batched(
+    model_path: str,
+    batch_frames: List,
+    conf_threshold: float,
+    config: Dict,
+    preprocessed_data=None
+) -> List:
+    """
+    Perform YOLO inference on a batch of frames using Ultralytics.
+    
+    Args:
+        model_path: Path to the YOLO model
+        batch_frames: List of frame images
+        conf_threshold: Confidence threshold for detections
+        config: Configuration dictionary
+        preprocessed_data: Ignored for Ultralytics implementation
+        
+    Returns:
+        List of detection results for each frame
+    """
+    global player_model, ball_model
+    
+    # Use global models to avoid reloading
+    if "player" in model_path:
+        if player_model is None:
+            logger.info(f"Loading player YOLO model from {model_path}")
+            player_model = load_yolo_model(model_path)
+        model = player_model
+    else:  # ball model
+        if ball_model is None:
+            logger.info(f"Loading ball YOLO model from {model_path}")
+            ball_model = load_yolo_model(model_path)
+        model = ball_model
+    
+    # Run inference using Ultralytics
+    # We use explicit batch size instead of auto-batching to control memory usage
+    MAX_INTERNAL_BATCH = 16  # To prevent OOM on lower-memory GPUs
+    batch_results = []
+    
+    # Process in smaller internal batches if needed
+    for start_idx in range(0, len(batch_frames), MAX_INTERNAL_BATCH):
+        end_idx = min(start_idx + MAX_INTERNAL_BATCH, len(batch_frames))
+        sub_batch = batch_frames[start_idx:end_idx]
+        
+        try:
+            # Run inference on batch (Ultralytics handles batching internally)
+            # conf is confidence threshold, verbose=False prevents output to console
+            results = model(sub_batch, conf=conf_threshold, verbose=False)
+            
+            # Process results into the expected format
+            for i, result in enumerate(results):
+                # Create a detection result object similar to previous format
+                class DetectionResult:
+                    def __init__(self, xyxy, confidence, class_ids):
+                        self.xyxy = xyxy
+                        self.confidence = confidence
+                        self.class_ids = class_ids
+                
+                # Extract bounding boxes, confidences, and class IDs
+                boxes = []
+                confidences = []
+                class_ids = []
+                
+                if len(result.boxes) > 0:
+                    # Extract boxes in xyxy format (xmin, ymin, xmax, ymax)
+                    for box in result.boxes:
+                        boxes.append(box.xyxy[0].tolist())  # Get as list
+                        confidences.append(float(box.conf[0]))
+                        class_ids.append(int(box.cls[0]))
+                
+                detection_result = DetectionResult(boxes, confidences, class_ids)
+                batch_results.append([detection_result])
+        
+        except Exception as e:
+            logger.error(f"Error processing batch with YOLO: {e}")
+            # Add None for each frame in the failed batch
+            batch_results.extend([None] * len(sub_batch))
+    
+    return batch_results
+
+def warmup_yolo_models(config: Dict):
+    """
+    Warm up YOLO models by running a dummy inference.
+    
+    Args:
+        config: Configuration dictionary
+    """
+    global player_model, ball_model
+    
+    # Warm up player model
+    player_model_path = config.get('player_model_path', "soccer3d/models/player_model/model.engine")
+    logger.info(f"Warming up player YOLO model at {player_model_path}")
+    if not os.path.exists(player_model_path):
+        logger.warning(f"Player model not found at {player_model_path}")
+    else:
+        # Create a dummy input
+        dummy_input = np.zeros((64, 64, 3), dtype=np.uint8)
+        try:
+            player_model = load_yolo_model(player_model_path)
+            _ = player_model(dummy_input, verbose=False)
+        except Exception as e:
+            logger.error(f"Error warming up player model: {e}")
+    
+    # Warm up ball model
+    ball_model_path = config.get('ball_model_path', "soccer3d/models/ball_model/model.engine")
+    logger.info(f"Warming up ball YOLO model at {ball_model_path}")
+    if not os.path.exists(ball_model_path):
+        logger.warning(f"Ball model not found at {ball_model_path}")
+    else:
+        # Create a dummy input
+        dummy_input = np.zeros((64, 64, 3), dtype=np.uint8)
+        try:
+            ball_model = load_yolo_model(ball_model_path)
+            _ = ball_model(dummy_input, verbose=False)
+        except Exception as e:
+            logger.error(f"Error warming up ball model: {e}")
+    
+    logger.info("YOLO models warmed up successfully")
 
 def parse_args():
     """Parse command-line arguments."""
@@ -58,6 +215,8 @@ def parse_args():
                         help="Ending frame number for processing multiple frames")
     parser.add_argument("--loop", action="store_true",
                         help="Process frames in a continuous loop from start to end")
+    parser.add_argument("--stats", action="store_true",
+                        help="Calculate and display detailed timing statistics")
     
     # Configuration options
     parser.add_argument("--config", type=str, 
@@ -65,32 +224,33 @@ def parse_args():
     parser.add_argument("--log-level", type=str, choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                         help="Logging level")
     
-    # Triton server options
-    parser.add_argument("--player-model-url", type=str,
-                        help="URL for player detector model")
-    parser.add_argument("--ball-model-url", type=str,
-                        help="URL for ball detector model")
+    # Model options
+    parser.add_argument("--model-precision", type=str, choices=["fp16", "fp32", "int8"], default="fp16",
+                        help="Model precision (default: fp16)")
+    
+    # Performance options
+    parser.add_argument("--batch-size", type=int, 
+                        help="Maximum processing batch size (default from config)")
+    parser.add_argument("--max-workers", type=int,
+                        help="Maximum number of worker threads (default from config)")
+    parser.add_argument("--frame-cache-size", type=int, default=500,
+                        help="Number of frames to keep in memory cache (default: 500)")
+    parser.add_argument("--preload-all", action="store_true", default=True,
+                        help="Preload all frames at the beginning (default: True)")
+    parser.add_argument("--no-preload-all", action="store_false", dest="preload_all",
+                        help="Disable preloading all frames at the beginning")
     
     # Output options
     parser.add_argument("--output-dir", type=str, default="output",
                         help="Directory to save output (default: output)")
-    parser.add_argument("--debug", action="store_true",
-                        help="Enable debug mode with additional outputs")
-    parser.add_argument("--skip-saving", action="store_true",
-                        help="Skip saving JSON files to disk (only publish to MQTT if enabled)")
-    
-    # MQTT options
-    parser.add_argument("--mqtt-broker", type=str, default="localhost",
-                        help="MQTT broker address (default: localhost)")
-    parser.add_argument("--mqtt-port", type=int, default=1883,
-                        help="MQTT broker port (default: 1883)")
-    parser.add_argument("--mqtt-topic", type=str, default="soccer3d/data",
-                        help="MQTT topic for publishing data (default: soccer3d/data)")
-    parser.add_argument("--mqtt-disable", action="store_true",
-                        help="Disable MQTT publishing")
+    parser.add_argument("--stream-only", action="store_true",
+                        help="Only stream results without saving to disk")
+    parser.add_argument("--batch-writes", action="store_true",
+                        help="Batch writes to reduce disk I/O (default: False)")
+    parser.add_argument("--write-interval", type=float, default=5.0,
+                        help="Interval in seconds between batch writes (default: 5)")
     
     return parser.parse_args()
-
 
 def process_frame(frame_number: int, config: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -103,44 +263,42 @@ def process_frame(frame_number: int, config: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Results dictionary with detected positions and orientations
     """
-    global logger
+    global logger, _ALL_PRELOADED_FRAMES
     # Start timing
     total_start_time = time.time()
     
-    # Load camera transformation data
-    try:
-        with open('output_frames/per_cam_transforms.json', 'r') as f:
-            camera_data = json.load(f)
-        logger.info(f"Loaded camera transformation data with {len(camera_data.get('frames', []))} total cameras")
-    except FileNotFoundError:
-        logger.error("Error: Could not find the per_cam_transforms.json file.")
-        return {}
-    except json.JSONDecodeError:
-        logger.error("Error: Invalid JSON in per_cam_transforms.json file.")
-        return {}
+    # Create wall time dictionary to track real elapsed time for each phase
+    wall_time = {
+        'preprocessing': 0.0,
+        'detection': 0.0,
+        'pose_detection': 0.0,
+        'triangulation': 0.0,
+        'postprocessing': 0.0,
+        'total': 0.0
+    }
     
-    # STEP 1: Preload all frames from output_frames directory into RAM 
-    preload_start = time.time()
-    preloaded_frames = preload_camera_frames(frame_number, camera_data)
-    preload_time = time.time() - preload_start
-    logger.info(f"Preloaded {len(preloaded_frames)} frames in {preload_time:.2f} seconds")
+    # PHASE 1: PREPROCESSING - START
+    preprocessing_start = time.time()
     
-    # STEP 2: Prepare batched processing
-    all_player_rays = []
-    all_ball_rays = []
-    all_pose_rays = {i: [] for i in range(33)}  # MediaPipe has 33 keypoints
+    # Use cached camera transformation data
+    camera_data = load_camera_transforms_cached()
     
-    # Maximum batch size for efficient processing
-    MAX_BATCH_SIZE = 20  # Match Triton server configuration
+    # Use preloaded frames if available, otherwise load them
+    if _ALL_PRELOADED_FRAMES and frame_number in _ALL_PRELOADED_FRAMES:
+        preloaded_frames = _ALL_PRELOADED_FRAMES[frame_number]
+        logger.debug(f"Using preloaded frames for frame {frame_number}")
+    else:
+        logger.debug(f"Preloaded frames not available for frame {frame_number}, loading on demand")
+        preloaded_frames = preload_camera_frames(frame_number, camera_data)
     
+    # Filter and collect valid camera frames for batched processing
+    valid_cameras = []
     # Prepare batches for player and ball detection
     player_batch_frames = []
     ball_batch_frames = []
     player_batch_info = []
     ball_batch_info = []
     
-    # Filter and collect valid camera frames for batched processing
-    valid_cameras = []
     for frame_info in camera_data.get('frames', []):
         file_path = frame_info.get('file_path', '')
         
@@ -213,13 +371,17 @@ def process_frame(frame_number: int, config: Dict[str, Any]) -> Dict[str, Any]:
             'intrinsics': intrinsics
         })
     
-    logger.info(f"Processing {len(valid_cameras)} valid camera frames in batches of up to {MAX_BATCH_SIZE}")
+    logger.info(f"Processing {len(valid_cameras)} valid camera frames")
     
-    # STEP 3: Process player detection in batches
-    player_detections_by_camera = {}
-    ball_detections_by_camera = {}
+    # Maximum batch size for efficient processing - exactly matching camera count
+    MAX_BATCH_SIZE = 20  # Exactly 20 cameras, process all in one batch
     
-    # Use ThreadPoolExecutor to process both player and ball detection in parallel
+    # PHASE 1: PREPROCESSING - END
+    wall_time['preprocessing'] = time.time() - preprocessing_start
+    logger.info(f"Preprocessing completed in {wall_time['preprocessing']:.3f}s")
+    
+    # PHASE 2: DETECTION - START
+    detection_start = time.time()
     
     # Create all batch tasks
     player_batch_tasks = []
@@ -235,9 +397,9 @@ def process_frame(frame_number: int, config: Dict[str, Any]) -> Dict[str, Any]:
             'frames': batch_frames,
             'info': batch_info,
             'batch_idx': batch_idx,
-            'model_url': config['player_model_url'],
+            'model_path': config['player_model_path'],
             'conf_threshold': config['player_conf_threshold'],
-            'type': 'player'
+            'type': 'player',
         })
     
     # Prepare ball batch tasks
@@ -250,29 +412,33 @@ def process_frame(frame_number: int, config: Dict[str, Any]) -> Dict[str, Any]:
             'frames': batch_frames,
             'info': batch_info,
             'batch_idx': batch_idx,
-            'model_url': config['ball_model_url'],
+            'model_path': config['ball_model_path'],
             'conf_threshold': config['ball_conf_threshold'],
-            'type': 'ball'
+            'type': 'ball',
         })
+    
+    # Use ThreadPoolExecutor to process both player and ball detection in parallel
+    player_detections_by_camera = {}
+    ball_detections_by_camera = {}
     
     # Define a function to process a batch
     def process_batch(task):
         try:
             batch_type = task['type']
             batch_idx = task['batch_idx']
-            model_url = task['model_url']
+            model_path = task['model_path']
             conf_threshold = task['conf_threshold']
             batch_frames = task['frames']
             batch_info = task['info']
             
             logger.info(f"Processing {batch_type} detection batch {batch_idx//MAX_BATCH_SIZE + 1} with {len(batch_frames)} frames")
             
-            # Process batch
+            # Process batch with YOLO model directly
             batch_detections = perform_yolo_inference_batched(
-                model_url,
+                model_path,
                 batch_frames,
                 conf_threshold,
-                config
+                config,
             )
             
             # Return results with info
@@ -296,62 +462,69 @@ def process_frame(frame_number: int, config: Dict[str, Any]) -> Dict[str, Any]:
     batch_workers = min(len(all_tasks), config['max_workers'])
     logger.info(f"Processing {len(all_tasks)} detection batches using {batch_workers} parallel workers")
     
-    with ThreadPoolExecutor(max_workers=batch_workers) as executor:
-        # Submit all tasks
-        futures = {executor.submit(process_batch, task): task for task in all_tasks}
-        
-        # Process results as they complete
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                batch_type = result['type']
-                batch_detections = result['detections']
-                batch_info = result['info']
-                
-                # Store results by camera
-                for i, (detection, info) in enumerate(zip(batch_detections, batch_info)):
-                    if detection is not None:
-                        if batch_type == 'player':
-                            player_detections_by_camera[info['file_path']] = detection
-                        else:  # ball
-                            ball_detections_by_camera[info['file_path']] = detection
-            except Exception as e:
-                task = futures[future]
-                logger.error(f"Error processing {task['type']} batch {task['batch_idx']//MAX_BATCH_SIZE + 1}: {e}")
+    # Use a reusable thread pool for batch processing
+    executor = get_thread_pool('batch_processing', max_workers=batch_workers)
+    
+    # Submit all tasks
+    futures = {executor.submit(process_batch, task): task for task in all_tasks}
+    
+    # Process results as they complete
+    for future in as_completed(futures):
+        try:
+            result = future.result()
+            batch_type = result['type']
+            batch_detections = result['detections']
+            batch_info = result['info']
+            
+            # Store results by camera
+            for i, (detection, info) in enumerate(zip(batch_detections, batch_info)):
+                if detection is not None:
+                    if batch_type == 'player':
+                        player_detections_by_camera[info['file_path']] = detection
+                    else:  # ball
+                        ball_detections_by_camera[info['file_path']] = detection
+        except Exception as e:
+            task = futures[future]
+            logger.error(f"Error processing {task['type']} batch {task['batch_idx']//MAX_BATCH_SIZE + 1}: {e}")
     
     logger.info(f"Completed all detection batches: {len(player_detections_by_camera)} player and {len(ball_detections_by_camera)} ball detections")
     
-    # STEP 5: Process results for each camera (pose estimation and ray creation)
+    # PHASE 2: DETECTION - END
+    wall_time['detection'] = time.time() - detection_start
+    logger.info(f"Detection completed in {wall_time['detection']:.3f}s")
+    
+    # PHASE 3: POSE ESTIMATION - START
+    pose_start = time.time()
+    
+    # Process results for each camera (pose estimation and ray creation)
+    all_player_rays = []
+    all_ball_rays = []
+    all_pose_rays = {i: [] for i in range(33)}  # MediaPipe has 33 keypoints
+    
     pose_processing_tasks = []
     
+    # Prepare pose processing tasks
     for camera in valid_cameras:
         file_path = camera['file_path']
-        # Skip if no player detection for this camera
-        if file_path not in player_detections_by_camera:
-            continue
+        
+        # Process player detections for this camera
+        if file_path in player_detections_by_camera:
+            player_detection = player_detections_by_camera[file_path]
             
-        player_detection = player_detections_by_camera[file_path]
-        # Check if detection exists and has valid boxes
-        if (player_detection is None or
-            len(player_detection) == 0 or
-            not hasattr(player_detection[0], 'xyxy') or
-            len(player_detection[0].xyxy) == 0):
-            continue
-            
-        # Add pose processing tasks for each player in each camera
-        for idx, box in enumerate(player_detection[0].xyxy):
-            # Validate box coordinates
-            if box[0] >= box[2] or box[1] >= box[3]:
-                continue
+            # Check if detection exists and has valid boxes
+            if (player_detection is not None and 
+                len(player_detection) > 0 and 
+                hasattr(player_detection[0], 'xyxy') and 
+                len(player_detection[0].xyxy) > 0):
                 
-            pose_processing_tasks.append({
-                'camera': camera,
-                'box': box,
-                'player_idx': idx
-            })
-    
-    # Process player pose in parallel
-    logger.info(f"Processing {len(pose_processing_tasks)} player poses in parallel")
+                # Process each player detected in this camera view
+                for player_idx, box in enumerate(player_detection[0].xyxy):
+                    # Add to pose processing tasks
+                    pose_processing_tasks.append({
+                        'camera': camera,
+                        'box': box,
+                        'player_idx': player_idx
+                    })
     
     # Define function to process a single player pose
     def process_player_pose(task):
@@ -436,28 +609,30 @@ def process_frame(frame_number: int, config: Dict[str, Any]) -> Dict[str, Any]:
                 'player_idx': player_idx
             }
     
-    # Process all player poses in parallel
-    pose_workers = min(len(pose_processing_tasks), config['max_workers'])
+    # Process results in parallel
     if pose_processing_tasks:
+        pose_workers = min(len(pose_processing_tasks), config.get('mp_pose_pool_size', 4))
         logger.info(f"Processing {len(pose_processing_tasks)} player poses using {pose_workers} parallel workers")
         
-        with ThreadPoolExecutor(max_workers=pose_workers) as executor:
-            # Submit all tasks
-            pose_futures = [executor.submit(process_player_pose, task) for task in pose_processing_tasks]
-            
-            # Process results as they complete
-            for future in as_completed(pose_futures):
-                try:
-                    result = future.result()
-                    if result['player_ray'] is not None:
-                        all_player_rays.append(result['player_ray'])
-                    
-                    # Add pose rays to global collection
-                    for keypoint_id, ray in result['pose_rays'].items():
-                        all_pose_rays[keypoint_id].append(ray)
-                    
-                except Exception as e:
-                    logger.error(f"Error processing player pose result: {e}")
+        # Use a reusable thread pool for pose processing
+        executor = get_thread_pool('pose_processing', max_workers=pose_workers)
+        
+        # Submit all tasks
+        pose_futures = [executor.submit(process_player_pose, task) for task in pose_processing_tasks]
+        
+        # Process results as they complete
+        for future in as_completed(pose_futures):
+            try:
+                result = future.result()
+                if result['player_ray'] is not None:
+                    all_player_rays.append(result['player_ray'])
+                
+                # Add pose rays to global collection
+                for keypoint_id, ray in result['pose_rays'].items():
+                    all_pose_rays[keypoint_id].append(ray)
+                
+            except Exception as e:
+                logger.error(f"Error processing player pose result: {e}")
     
     # Process ball rays (simpler, can be done sequentially)
     for camera in valid_cameras:
@@ -515,9 +690,14 @@ def process_frame(frame_number: int, config: Dict[str, Any]) -> Dict[str, Any]:
     
     logger.info(f"Collected {len(all_player_rays)} player rays and {len(all_ball_rays)} ball rays")
     
-    # STEP 6: Find player and ball positions using ray intersection and triangulate pose in parallel
-    triangulation_start_time = time.time()  # Track triangulation time
+    # PHASE 3: POSE ESTIMATION - END
+    wall_time['pose_detection'] = time.time() - pose_start
+    logger.info(f"Pose detection completed in {wall_time['pose_detection']:.3f}s")
     
+    # PHASE 4: TRIANGULATION - START
+    triangulation_start = time.time()
+    
+    # Find player and ball positions using ray intersection and triangulate pose in parallel
     player_position = None
     ball_position = None
     pose_results = None
@@ -539,16 +719,18 @@ def process_frame(frame_number: int, config: Dict[str, Any]) -> Dict[str, Any]:
         return triangulate_pose(all_pose_rays, config)
     
     # Run all triangulation tasks in parallel
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        # Submit all tasks
-        player_future = executor.submit(find_player_position)
-        ball_future = executor.submit(find_ball_position)
-        pose_future = executor.submit(process_pose)
-        
-        # Get results
-        player_position = player_future.result()
-        ball_position = ball_future.result()
-        pose_3d, orientation_vector, cardinal_direction = pose_future.result()
+    # Use a reusable thread pool for triangulation
+    executor = get_thread_pool('triangulation', max_workers=3)
+    
+    # Submit all tasks
+    player_future = executor.submit(find_player_position)
+    ball_future = executor.submit(find_ball_position)
+    pose_future = executor.submit(process_pose)
+    
+    # Get results
+    player_position = player_future.result()
+    ball_position = ball_future.result()
+    pose_3d, orientation_vector, cardinal_direction = pose_future.result()
     
     # Log positions
     if player_position is not None:
@@ -556,16 +738,29 @@ def process_frame(frame_number: int, config: Dict[str, Any]) -> Dict[str, Any]:
     
     if ball_position is not None:
         logger.info(f"Ball position: [{ball_position[0]:.2f}, {ball_position[1]:.2f}, {ball_position[2]:.2f}]")
-        
-    triangulation_time = time.time() - triangulation_start_time
-    logger.info(f"Parallel triangulation completed in {triangulation_time:.3f}s")
     
-    # STEP 7: Create results dictionary
+    # PHASE 4: TRIANGULATION - END
+    wall_time['triangulation'] = time.time() - triangulation_start
+    logger.info(f"Triangulation completed in {wall_time['triangulation']:.3f}s")
+    
+    # PHASE 5: POSTPROCESSING - START
+    postprocessing_start = time.time()
+    
+    # Create results dictionary
     results = create_output(frame_number, player_position, ball_position, pose_3d, orientation_vector, cardinal_direction)
     
-    # Log total processing time
-    total_time = time.time() - total_start_time
-    logger.info(f"Total processing time: {total_time:.2f}s")
+    # PHASE 5: POSTPROCESSING - END
+    wall_time['postprocessing'] = time.time() - postprocessing_start
+    logger.info(f"Postprocessing completed in {wall_time['postprocessing']:.3f}s")
+    
+    # Calculate total wall time
+    wall_time['total'] = time.time() - total_start_time
+    logger.info(f"Total processing time: {wall_time['total']:.3f}s")
+    
+    # Store wall times for stats reporting
+    # Import global TIMING dict to store our wall times
+    from soccer3d.models.detection import TIMING as detection_timing
+    detection_timing['wall_time'] = wall_time
     
     return results
 
@@ -657,79 +852,190 @@ def create_output(
     return output
 
 
-def save_output(output_data: Dict[str, Any], output_dir: str, frame_number: int, skip_saving: bool = False) -> str:
+def save_output(output_data: Dict[str, Any], output_dir: str, frame_number: int, stream_only: bool = False) -> str:
     """
     Save output data to a JSON file and publish to MQTT broker.
+    Uses batching to reduce disk I/O.
     
     Args:
         output_data: Output data dictionary
         output_dir: Directory to save output
         frame_number: Frame number for filename
-        skip_saving: Whether to skip saving the JSON file to disk
+        stream_only: Whether to only stream results without saving to disk
         
     Returns:
         Path to saved file or empty string if skipped
     """
-    # Convert output data to JSON string
+    global _OUTPUT_CACHE, _OUTPUT_CACHE_LOCK, _LAST_WRITE_TIME
+    
+    # Convert output data to JSON string (needed for streaming anyway)
     json_str = json.dumps(output_data, indent=2)
     
+    # Stream results if streaming is enabled
+    # This is where you would add code to stream via MQTT, WebSockets, etc.
+    # For example, if using MQTT:
+    #
+    # if mqtt_client and mqtt_topic:
+    #     mqtt_client.publish(mqtt_topic, json_str)
+    
+    # If we're only streaming, return early
+    if stream_only:
+        return ""
+    
     filepath = ""
-    if not skip_saving:
-        # Create output directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Generate filename
+    
+    # Get current time for batching decision
+    current_time = time.time()
+    
+    with _OUTPUT_CACHE_LOCK:
+        # Add to output cache
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"soccer3d_frame_{frame_number}_{timestamp}.json"
         filepath = os.path.join(output_dir, filename)
         
-        # Write to file
-        with open(filepath, 'w') as f:
-            f.write(json_str)
+        _OUTPUT_CACHE.append({
+            'json_str': json_str,
+            'filepath': filepath,
+            'frame_number': frame_number
+        })
         
-        logger.info(f"Output saved to {filepath}")
-    
-    # Check if MQTT is available
-    try:
-        import paho.mqtt.client as mqtt
+        # Check if it's time to write the batch or if this is the first write
+        should_write = (current_time - _LAST_WRITE_TIME) >= _WRITE_INTERVAL or _LAST_WRITE_TIME == 0
         
-        # Publish to MQTT broker if mqtt configuration exists
-        if config.get('mqtt_broker'):
-            try:
-                broker = config.get('mqtt_broker', 'localhost')
-                port = config.get('mqtt_port', 1883)
-                topic = config.get('mqtt_topic', 'soccer3d/data')
-                
-                # Create MQTT client
-                client = mqtt.Client()
-                
-                # Connect to broker
-                logger.info(f"Connecting to MQTT broker at {broker}:{port}")
-                client.connect(broker, port, 60)
-                
-                # Publish data
-                logger.info(f"Publishing data to topic: {topic}")
-                result = client.publish(topic, json_str)
-                
-                # Check if publish was successful
-                if result.rc == mqtt.MQTT_ERR_SUCCESS:
-                    logger.info("Data successfully published to MQTT broker")
-                else:
-                    logger.warning(f"Failed to publish data to MQTT broker: {result.rc}")
-                
-                # Disconnect
-                client.disconnect()
-            except Exception as e:
-                logger.error(f"Error publishing to MQTT broker: {e}")
-    except ImportError:
-        logger.warning("paho-mqtt not installed. MQTT publishing disabled.")
+        # If it's time to write or we have too many cached outputs, write them to disk
+        if should_write or len(_OUTPUT_CACHE) > 20:
+            # Create output directory if it doesn't exist
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Write all cached outputs
+            frames_written = []
+            for output in _OUTPUT_CACHE:
+                with open(output['filepath'], 'w') as f:
+                    f.write(output['json_str'])
+                frames_written.append(output['frame_number'])
+            
+            # Log what we wrote
+            logger.info(f"Batch wrote {len(frames_written)} frames to {output_dir} (frames {min(frames_written)}-{max(frames_written)})")
+            
+            # Clear the cache and update the last write time
+            _OUTPUT_CACHE.clear()
+            _LAST_WRITE_TIME = current_time
+        else:
+            # If we're not writing yet, log that we've cached the output
+            logger.debug(f"Cached output for frame {frame_number} (will write in batch later)")
     
     return filepath
 
 
+def collect_timing_stats() -> Dict[str, Dict[str, float]]:
+    """
+    Collect timing statistics from all modules.
+    
+    Returns:
+        Dictionary containing wall time statistics for each pipeline phase
+    """
+    # Import TIMING dictionaries from all modules to get wall time data
+    from soccer3d.models.detection import TIMING as detection_timing
+    
+    # Get the wall time measurements
+    wall_time = detection_timing.get('wall_time', {})
+    
+    if not wall_time:
+        # Fallback if no wall time recorded
+        return {
+            "error": {
+                "message": "No wall time measurements available"
+            }
+        }
+    
+    # Collect all stats into categories using real wall time
+    stats = {
+        "preprocessing": {
+            "wall_time": wall_time.get('preprocessing', 0.0),
+        },
+        "detection": {
+            "wall_time": wall_time.get('detection', 0.0),
+        },
+        "pose_detection": {
+            "wall_time": wall_time.get('pose_detection', 0.0),
+        },
+        "triangulation": {
+            "wall_time": wall_time.get('triangulation', 0.0),
+        },
+        "postprocessing": {
+            "wall_time": wall_time.get('postprocessing', 0.0),
+        },
+        "total": {
+            "wall_time": wall_time.get('total', 0.0),
+        }
+    }
+    
+    # Calculate percentage of total for each phase
+    total_wall_time = wall_time.get('total', 0.0)
+    if total_wall_time > 0:
+        for category, timings in stats.items():
+            if category != "total":
+                phase_time = timings.get("wall_time", 0.0)
+                timings["percentage"] = (phase_time / total_wall_time) * 100
+    
+    return stats
+
+
+def print_timing_stats(stats: Dict[str, Dict[str, float]], total_frames: int = 1) -> None:
+    """
+    Print timing statistics in a formatted way.
+    
+    Args:
+        stats: Dictionary of timing statistics
+        total_frames: Number of frames processed
+    """
+    if "error" in stats:
+        logger.error(f"Error in timing stats: {stats['error']['message']}")
+        return
+    
+    # Print header
+    logger.info("=" * 80)
+    logger.info(f"SOCCER3D WALL TIME STATISTICS (averaged over {total_frames} frames)")
+    logger.info("=" * 80)
+    
+    # Get total time
+    total_time = stats.get("total", {}).get("wall_time", 0.0)
+    per_frame_total = total_time / total_frames
+    
+    # Print each phase in pipeline order
+    phases = ["preprocessing", "detection", "pose_detection", "triangulation", "postprocessing"]
+    
+    for phase in phases:
+        phase_stats = stats.get(phase, {})
+        wall_time = phase_stats.get("wall_time", 0.0)
+        percentage = phase_stats.get("percentage", 0.0)
+        per_frame = wall_time / total_frames
+        
+        logger.info(f"{phase.upper()}: {wall_time:.3f}s total, {per_frame:.3f}s/frame ({percentage:.1f}% of pipeline)")
+    
+    # Print the grand total
+    logger.info("-" * 80)
+    logger.info(f"TOTAL PIPELINE: {total_time:.3f}s total, {per_frame_total:.3f}s/frame")
+    
+    # Calculate internal FPS (pipeline-only)
+    internal_fps = total_frames / total_time if total_time > 0 else 0
+    logger.info(f"Internal processing speed: {internal_fps:.2f} FPS (pipeline only)")
+    
+    # Print real-world FPS if available
+    real_wall_time = stats.get("total", {}).get("real_wall_time", 0.0)
+    real_fps = stats.get("total", {}).get("real_fps", 0.0)
+    
+    if real_wall_time > 0:
+        logger.info("-" * 80)
+        logger.info(f"REAL WALL CLOCK TIME: {real_wall_time:.2f}s total, {real_wall_time/total_frames:.3f}s/frame")
+        logger.info(f"ACTUAL PROCESSING SPEED: {real_fps:.2f} FPS (including I/O, saving, etc.)")
+    
+    logger.info("=" * 80)
+
+
 def main():
     """Main entry point for the Soccer3D command-line tool."""
-    global logger, config
+    global logger, config, _FRAME_CACHE_MAX_SIZE, _WRITE_INTERVAL, _ALL_PRELOADED_FRAMES
     
     # Parse command-line arguments
     args = parse_args()
@@ -738,22 +1044,27 @@ def main():
     config, logger = initialize(args.config)
     
     # Override configuration with command-line arguments
-    if args.player_model_url:
-        config['player_model_url'] = args.player_model_url
-    if args.ball_model_url:
-        config['ball_model_url'] = args.ball_model_url
     if args.log_level:
         config['log_level'] = args.log_level
+    if args.max_workers:
+        config['max_workers'] = args.max_workers
+    if args.batch_size:
+        config['batch_size'] = args.batch_size
     
-    # Add MQTT parameters to config if present in args
-    if hasattr(args, 'mqtt_broker') and args.mqtt_broker:
-        config['mqtt_broker'] = args.mqtt_broker
-    if hasattr(args, 'mqtt_port') and args.mqtt_port:
-        config['mqtt_port'] = args.mqtt_port
-    if hasattr(args, 'mqtt_topic') and args.mqtt_topic:
-        config['mqtt_topic'] = args.mqtt_topic
-    if hasattr(args, 'mqtt_disable') and args.mqtt_disable:
-        config['mqtt_disable'] = args.mqtt_disable
+    # Update frame cache size if specified
+    if args.frame_cache_size:
+        from soccer3d.utils.camera import _FRAME_CACHE_MAX_SIZE
+        _FRAME_CACHE_MAX_SIZE = args.frame_cache_size
+        logger.info(f"Setting frame cache size to {_FRAME_CACHE_MAX_SIZE}")
+    
+    # Update write interval if batch writes enabled
+    if args.batch_writes:
+        _WRITE_INTERVAL = args.write_interval
+        logger.info(f"Batch writes enabled with interval of {_WRITE_INTERVAL}s")
+    
+    # Add model precision configuration
+    config['model_precision'] = args.model_precision
+    logger.info(f"Using model precision: {config['model_precision']}")
     
     # Show current configuration
     logger.info(f"Using configuration: {config}")
@@ -764,15 +1075,15 @@ def main():
         logger.info("Initializing MediaPipe pose model pool...")
         initialize_mp_pose_pool(config)
         
-        # Initialize Triton clients
-        logger.info("Initializing Triton clients...")
-        if not initialize_triton_clients(config):
-            logger.error("Failed to initialize Triton clients. Please ensure Triton server is running.")
-            sys.exit(1)
-        
-        # Warm up models
+        # Warm up PyTorch CUDA
         warmup_pytorch_cuda()
-        warmup_triton_inference(config)
+        
+        # Warm up YOLO models
+        warmup_yolo_models(config)
+    
+    # Handle stream-only mode
+    if args.stream_only:
+        logger.info("Stream-only mode enabled - no output files will be written")
     
     # Determine frame range to process
     start_frame = args.start_frame if args.start_frame is not None else args.frame
@@ -786,12 +1097,28 @@ def main():
     logger.info(f"Frame processing range: {start_frame} to {end_frame}")
     if args.loop:
         logger.info("Loop mode enabled: Will process frames continuously until interrupted")
-        if not args.skip_saving:
-            logger.warning("Loop mode is enabled but --skip-saving is not. This may generate a lot of files.")
+        if not args.stream_only:
+            logger.warning("Loop mode is enabled but --stream-only is not. This may generate a lot of files.")
+    
+    # Preload all frames at once if processing multiple frames and preload_all is enabled
+    if args.preload_all and end_frame > start_frame:
+        logger.info(f"Preloading all frames from {start_frame} to {end_frame}...")
+        from soccer3d.utils.camera import preload_all_frames
+        _ALL_PRELOADED_FRAMES = preload_all_frames(start_frame, end_frame)
+        logger.info(f"Preloaded {len(_ALL_PRELOADED_FRAMES)} frames ({sum(len(frames) for frames in _ALL_PRELOADED_FRAMES.values())} total images)")
+    else:
+        if not args.preload_all:
+            logger.info("Frame preloading disabled, will load frames on demand")
+        elif end_frame == start_frame:
+            logger.info("Processing single frame, no need to preload multiple frames")
+    
+    # Start wall clock timing for entire processing
+    processing_start_time = time.time()
     
     try:
         # Process frames
         current_frame = start_frame
+        frames_processed = 0
         
         while True:
             logger.info(f"Processing frame {current_frame}")
@@ -799,10 +1126,11 @@ def main():
             try:
                 # Process the frame
                 results = process_frame(current_frame, config)
+                frames_processed += 1
                 
                 # Save the results
                 if results:
-                    save_output(results, args.output_dir, current_frame, args.skip_saving)
+                    save_output(results, args.output_dir, current_frame, args.stream_only)
                 else:
                     logger.error(f"No results generated for frame {current_frame}")
             except Exception as e:
@@ -827,6 +1155,37 @@ def main():
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
         sys.exit(1)
+    finally:
+        # Make sure to clean up thread pools
+        shutdown_thread_pools()
+    
+    # End wall clock timing
+    processing_end_time = time.time()
+    total_wall_time = processing_end_time - processing_start_time
+    real_fps = frames_processed / total_wall_time if total_wall_time > 0 else 0
+    
+    # Print timing statistics if requested
+    if args.stats and frames_processed > 0:
+        try:
+            logger.info(f"Collecting timing statistics for {frames_processed} processed frames...")
+            stats = collect_timing_stats()
+            
+            # Add real wall time to stats
+            if "total" not in stats:
+                stats["total"] = {}
+            stats["total"]["real_wall_time"] = total_wall_time
+            stats["total"]["real_fps"] = real_fps
+            
+            print_timing_stats(stats, frames_processed)
+            
+            # Log actual wall clock time separately
+            logger.info("=" * 80)
+            logger.info(f"REAL WALL CLOCK STATISTICS:")
+            logger.info(f"Total wall clock time: {total_wall_time:.2f}s for {frames_processed} frames")
+            logger.info(f"Real processing speed: {real_fps:.2f} FPS (frames per second)")
+            logger.info("=" * 80)
+        except Exception as e:
+            logger.error(f"Error collecting timing statistics: {e}")
     
     logger.info("Soccer3D processing complete")
 
